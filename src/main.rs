@@ -14,18 +14,18 @@ const TILE_SIZE : u16 = 8;
 use::agb::{
     display::{
         object::{Object, Graphics, Tag, OamManaged},
-        tiled::{ RegularMap, RegularBackgroundSize, TiledMap, VRamManager, TileFormat},
+        tiled::{ RegularMap, RegularBackgroundSize, TiledMap, VRamManager},
         Priority,
-        Font,
     },
     input::{Tri, Button},
+    save::{SaveManager, Error},
     include_background_gfx,
     include_aseprite,
-    include_font,
-    include_palette,
 };
 
 use::alloc::{vec::Vec};
+
+use core::ops::Not;
 
 include_background_gfx!(background_tiles, "ff00ff",
     tiles =>  deduplicate "gfx/tiles.aseprite"
@@ -41,21 +41,55 @@ pub struct Graph {
 
 pub type NodeIndex = usize;
 
-#[derive(PartialEq)]
-enum NodeState {
-    LIVE, DEAD, MENU_ITEM
+#[derive(Debug,PartialEq,Copy,Clone)]
+enum CellState {
+    Dead, Live
 }
 
+impl From<u16> for CellState {
+    fn from(item: u16) -> Self {
+        match item {
+            0 => Dead,
+            1 => Live,
+            _ => Dead
+        }
+    }
+}
+
+impl Not for CellState {
+    type Output = Self;
+    fn not(self) -> Self::Output {
+        match self {
+            Dead => Live,
+            Live => Dead
+        }
+    }
+}
+
+use crate::MenuType::*;
+use crate::NodeType::*;
+use crate::CellState::*;
+
+#[derive(PartialEq,Debug)]
+enum MenuType {
+    New, Save, Load
+}
+
+#[derive(Debug)]
+enum NodeType {
+    Cell(CellState),
+    Menu(MenuType),
+}
+
+#[derive(Debug)]
 pub struct NodeData {
-    state: NodeState,
+    state: NodeType,
     x: u16,
     y: u16,
     first_outgoing_edge: Option<EdgeIndex>
 }
 
 pub type EdgeIndex = usize;
-
-enum Direction {Left, Right, Up, Down}
 
 pub struct EdgeData {
     direction: Option<Button>,
@@ -69,7 +103,7 @@ impl Graph {
         Graph { nodes: Vec::new(), edges: Vec::new() }
     }
 
-    pub fn add_node(&mut self, x:u16, y:u16, state:NodeState) -> NodeIndex {
+    pub fn add_node(&mut self, x:u16, y:u16, state:NodeType) -> NodeIndex {
         let index = self.nodes.len();
         self.nodes.push(NodeData { x,y,state,first_outgoing_edge: None });
         index
@@ -94,8 +128,9 @@ impl Graph {
     pub fn living_neighbors_count_of(&self, source: NodeIndex) -> u16 {
         let mut n = 0;
         for e in self.successors(source) {
-            if self.nodes[e].state == NodeState::LIVE {
-                n = n+1;
+            match self.nodes[e].state {
+                Cell(s) => n += s as u16,
+                _ => n = n,
             }
         }
         n
@@ -133,7 +168,7 @@ pub struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     pub fn new(graph: &Graph, node: NodeIndex, object: &'a OamManaged) -> Self {
         let mut cursor_object = object.object_sprite(CURSOR_SPRITE.sprite(0));
-        cursor_object.show();
+        cursor_object.hide();
         let mut c = Cursor { node
                , x: graph.nodes[node].x
                , y: graph.nodes[node].y
@@ -186,20 +221,20 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn new_world(width: usize, height: usize) -> Graph {
+fn new_world(width: u16, height: u16) -> Graph {
     let mut graph = Graph::new();
-    for i in 0..WIDTH*HEIGHT {
-        graph.add_node(i%WIDTH, i/WIDTH, NodeState::DEAD);
+    for i in 0..width*height {
+        graph.add_node(i%width, i/width, Cell(Dead));
     }
-    for i in 0..WIDTH {
-    for j in 0..HEIGHT {
-        let n_right      = (i + 1) % WIDTH + j*WIDTH;
-        let n_down       = ((((j+1) % HEIGHT )*WIDTH))+i;
-        let n_down_right = ((((j+1) % HEIGHT )*WIDTH))+((i+1)%WIDTH);
+    for i in 0..width {
+    for j in 0..height {
+        let n_right      = (i + 1) % width + j*width;
+        let n_down       = ((((j+1) % height )*width))+i;
+        let n_down_right = ((((j+1) % height )*width))+((i+1)%width);
         let n_down_left : usize =
-              (((j+1) % HEIGHT )*WIDTH) as usize
-            + (i as isize -1 as isize).rem_euclid(WIDTH as isize) as usize;
-        let n = j*WIDTH+i;
+              (((j+1) % height )*width) as usize
+            + (i as isize -1 as isize).rem_euclid(width as isize) as usize;
+        let n = j*width+i;
         graph.add_edge(n.into(), (n_right).into(), Some(Button::RIGHT));
         graph.add_edge((n_right).into(), n.into(), Some(Button::LEFT));
         graph.add_edge(n.into(), (n_down).into(), Some(Button::DOWN));
@@ -214,6 +249,16 @@ fn new_world(width: usize, height: usize) -> Graph {
 
 fn new_config_menu(bg : &mut RegularMap, vram : &mut VRamManager, settings: &Settings) {
     let tileset = background_tiles::tiles.tiles;
+
+    for x in settings.window_x..settings.window_x+settings.window_width-1 {
+    for y in settings.window_y..settings.window_y+settings.window_height-1 {
+        bg.set_tile(
+            vram,
+            (x, y),
+            &tileset,
+            background_tiles::tiles.tile_settings[1],
+        );
+    }}
 
     // Borders
     for x in settings.window_x..settings.window_x+settings.window_width-1 {
@@ -296,7 +341,7 @@ fn new_config_menu(bg : &mut RegularMap, vram : &mut VRamManager, settings: &Set
     for x in 0..3 {
         bg.set_tile(
             vram,
-            (settings.window_x+settings.rules_offset_x-1+x, settings.window_y+settings.rules_offset_y+3),
+            (settings.window_x+settings.rules_offset_x+x, settings.window_y+settings.rules_offset_y+3),
             &tileset,
             background_tiles::tiles.tile_settings[32 + x as usize],
         );
@@ -304,7 +349,7 @@ fn new_config_menu(bg : &mut RegularMap, vram : &mut VRamManager, settings: &Set
     for x in 0..4 {
         bg.set_tile(
             vram,
-            (settings.window_x+settings.rules_offset_x-1+x, settings.window_y+settings.rules_offset_y+4),
+            (settings.window_x+settings.rules_offset_x+x, settings.window_y+settings.rules_offset_y+4),
             &tileset,
             background_tiles::tiles.tile_settings[24 + x as usize],
         );
@@ -312,7 +357,7 @@ fn new_config_menu(bg : &mut RegularMap, vram : &mut VRamManager, settings: &Set
     for x in 0..4 {
         bg.set_tile(
             vram,
-            (settings.window_x+settings.rules_offset_x-1+x, settings.window_y+settings.rules_offset_y+5),
+            (settings.window_x+settings.rules_offset_x+x, settings.window_y+settings.rules_offset_y+5),
             &tileset,
             background_tiles::tiles.tile_settings[28 + x as usize],
         );
@@ -340,8 +385,79 @@ enum GameState {
     Config
 }
 
+fn load_world(save: &mut SaveManager, graph: &mut Graph, settings: &mut Settings) -> Result<(),Error> {
+    let mut access = save.access()?;
+
+    let mut is_save = 0;
+    access.read(0, core::slice::from_mut(&mut is_save))?;
+
+    if is_save != 0 {
+        let mut b: u8 = 0;
+        let mut i = 0;
+        while i < graph.nodes.len() {
+            access.read(i, core::slice::from_mut(&mut b))?;
+            graph.nodes[i].state = match b {
+                b'L' => Cell(Live),
+                _ => Cell(Dead)
+            };
+            i+=1;
+        }
+        let mut j = 0;
+        while j < settings.rules[0].len() {
+            access.read(i+j, core::slice::from_mut(&mut b))?;
+            settings.rules[0][j] = b.into();
+            j+=1;
+        }
+        let mut k = 0;
+        while k < settings.rules[0].len() {
+            access.read(i+j+k, core::slice::from_mut(&mut b))?;
+            settings.rules[1][k] = b.into();
+            k+=1;
+        }
+    };
+    Ok(())
+
+}
+
+fn save_world(save: &mut SaveManager, graph: &Graph, settings: &Settings) -> Result<(), Error> {
+    let mut access = save.access()?;
+
+    let mut is_save = 0;
+    access.read(0, core::slice::from_mut(&mut is_save))?;
+
+    if is_save != 0 {
+        let mut i = 0;
+        while i < graph.nodes.len() {
+            access.prepare_write(i..i+1)?
+                  .write(i, &[
+                        match graph.nodes[i].state {
+                            Cell(Live) => b'L',
+                            Cell(Dead) => b'D',
+                            _ => b'X'
+                        }]
+                  )?;
+            i+=1;
+        }
+        let mut j = 0;
+        while j < settings.rules[0].len() {
+            access.prepare_write(i+j..i+j+1)?
+                  .write(i+j, &[ settings.rules[0][j] as u8 ])?;
+            j+=1;
+        }
+        let mut k = 0;
+        while k < settings.rules[1].len() {
+            access.prepare_write(i+j+k..i+j+k+1)?
+                  .write(i+j+k, &[settings.rules[1][k] as u8 ])?;
+            k+=1;
+        }
+    };
+    Ok(())
+}
+
 #[agb::entry]
 fn main(mut gba: agb::Gba) -> ! {
+
+    gba.save.init_sram();
 
     // Settings for Conway's Game of Life
     let mut settings = Settings {
@@ -370,7 +486,8 @@ fn main(mut gba: agb::Gba) -> ! {
         graph_settings.add_node(
             settings.window_x+settings.rules_offset_x+i,
             settings.window_y+settings.rules_offset_y+j,
-            if settings.rules[j as usize][i as usize] == 0 { NodeState::DEAD} else {NodeState::LIVE});
+            Cell(settings.rules[j as usize][i as usize].into())
+        );
     }}
     for j in 0..2 {
     for i in 0..9 {
@@ -386,17 +503,17 @@ fn main(mut gba: agb::Gba) -> ! {
 
     //Settings Graph (New/Save/Load)
     let node_new = graph_settings.add_node(
-            settings.window_x+settings.rules_offset_x-1,
+            settings.window_x+settings.rules_offset_x,
             settings.window_y+settings.rules_offset_y+3,
-            NodeState::MENU_ITEM);
+            Menu(New));
     let node_save = graph_settings.add_node(
-            settings.window_x+settings.rules_offset_x-1,
+            settings.window_x+settings.rules_offset_x,
             settings.window_y+settings.rules_offset_y+4,
-            NodeState::MENU_ITEM);
+            Menu(Save));
     let node_load = graph_settings.add_node(
-            settings.window_x+settings.rules_offset_x-1,
+            settings.window_x+settings.rules_offset_x,
             settings.window_y+settings.rules_offset_y+5,
-            NodeState::MENU_ITEM);
+            Menu(Load));
     graph_settings.add_edge(node_new, 9, Some(Button::UP));
     graph_settings.add_edge(node_new, node_save, Some(Button::DOWN));
     graph_settings.add_edge(node_save, node_new, Some(Button::UP));
@@ -412,7 +529,10 @@ fn main(mut gba: agb::Gba) -> ! {
     let mut graph = new_world(WIDTH.into(), HEIGHT.into());
 
     let object = gba.display.object.get_managed();
-    let mut cursor = Cursor::new(&graph, 0, &object);
+    let mut cursor_world = Cursor::new(&graph, 0, &object);
+    let mut cursor_config = Cursor::new(&graph_settings, 16, &object);
+    let mut cursor = &mut cursor_world;
+    cursor.show();
     object.commit();
 
     let (gfx, mut vram) = gba.display.video.tiled0();
@@ -428,14 +548,16 @@ fn main(mut gba: agb::Gba) -> ! {
         tileset.format(),
     );
 
-    agb::println!("{}", tileset.format() as usize);
-
     for n in &graph.nodes {
         bg.set_tile(
             &mut vram,
             (n.x, n.y),
             &tileset,
-            background_tiles::tiles.tile_settings[settings.tiles[if n.state == NodeState::DEAD { 0 } else {1}] as usize],
+            background_tiles::tiles.tile_settings[
+                settings.tiles[
+                    match n.state { Cell(s) => s as usize, _ => 0 }
+                ] as usize
+            ],
         );
     }
     bg.commit(&mut vram);
@@ -459,7 +581,6 @@ fn main(mut gba: agb::Gba) -> ! {
 
     timer.set_enabled(true);
     loop {
-
         input.update();
 
         match game_state {
@@ -475,6 +596,9 @@ fn main(mut gba: agb::Gba) -> ! {
                 if input.is_just_pressed(Button::START) {
                     game_state = GameState::Config;
                     bg_settings.set_visible(true);
+                    cursor.hide();
+                    cursor = &mut cursor_config;
+                    cursor.show();
                     cursor.set_position(&mut graph_settings, 18);
                     continue;
                 }
@@ -490,13 +614,16 @@ fn main(mut gba: agb::Gba) -> ! {
                     _ => ()
                 }
                 if input.is_just_pressed(Button::A) {
-                    let mut n = &mut (graph.nodes)[cursor.node];
-                    if n.state == NodeState::DEAD {
-                        n.state = NodeState::LIVE;
-                    } else if n.state == NodeState::LIVE {
-                        n.state = NodeState::DEAD;
+                    let n = &mut (graph.nodes)[cursor.node];
+                    match &n.state {
+                        Cell(s) => n.state = Cell(!*s),
+                        _ => (),
                     }
-                    let tile_id = if n.state == NodeState::LIVE { settings.tiles[1] } else {settings.tiles[0]};
+
+                    let tile_id = match n.state {
+                        Cell(s) => settings.tiles[s as usize],
+                        _ => 0,
+                    };
                     bg.set_tile(
                          &mut vram,
                          (n.x, n.y),
@@ -529,36 +656,55 @@ fn main(mut gba: agb::Gba) -> ! {
                 }
 
                 for i in 0..graph.nodes.len() {
-                    let current_state = if graph.nodes[i].state == NodeState::DEAD { 0 } else {1};
-                    let next_state = settings.rules[current_state][neighbors[i] as usize];
                     let n = &mut graph.nodes[i];
-                    n.state = if next_state == 0 { NodeState::DEAD } else {NodeState::LIVE};
+                    match n.state {
+                        Cell(s) => {
+                            n.state = Cell(settings.rules[s as usize][neighbors[i] as usize].into())
+                        },
+                        _ => (),
+                    }
+                    
+                    let tile = settings.tiles[
+                        match n.state {
+                            Cell(s) => s as usize,
+                            _ => 0,
+                        } as usize];
                     bg.set_tile(
                          &mut vram,
                          (n.x, n.y),
                          &tileset,
-                         background_tiles::tiles.tile_settings[settings.tiles[current_state] as usize],
+                         background_tiles::tiles.tile_settings[tile as usize],
                      );
                 }
             },
             GameState::Config => {
-                for n in &graph_settings.nodes {
-                    if (n.state == NodeState::LIVE || n.state == NodeState::DEAD) {
-                        let tile = settings.tiles[
-                            if n.state == NodeState::DEAD { 0 } else { 1 }
-                        ];
-                        bg_settings.set_tile(
-                            &mut vram,
-                            (n.x, n.y),
-                            &tileset,
-                            background_tiles::tiles.tile_settings[tile as usize]
-                        );
+                for n in &mut graph_settings.nodes {
+                    match n.state {
+                        Cell(s) => {
+
+                            let r = &mut settings.rules
+                                [(n.y-settings.window_y-settings.rules_offset_y) as usize]
+                                [(n.x-settings.window_x-settings.rules_offset_x) as usize];
+                            n.state = Cell((*r).into());
+
+                            let tile = settings.tiles[s as usize];
+                            bg_settings.set_tile(
+                                &mut vram,
+                                (n.x, n.y),
+                                &tileset,
+                                background_tiles::tiles.tile_settings[tile as usize]
+                            );
+                        }
+                        _ => (),
                     }
                 }
+
                 if input.is_just_pressed(Button::B) || input.is_just_pressed(Button::START) {
                     game_state = GameState::Paused;
                     bg_settings.set_visible(false);
-                    cursor.set_position(&mut graph, 0);
+                    cursor.hide();
+                    cursor = &mut cursor_world;
+                    cursor.show();
                     timer.set_enabled(false);
                     timer.set_enabled(true);
                     continue;
@@ -575,15 +721,51 @@ fn main(mut gba: agb::Gba) -> ! {
                 }
                 if input.is_just_pressed(Button::A) {
                     let mut n = &mut (graph_settings.nodes)[cursor.node];
-                    n.state = match n.state {
-                        NodeState::DEAD => NodeState::LIVE,
-                        NodeState::LIVE => NodeState::DEAD, 
-                        _ => NodeState::MENU_ITEM
-                    };
-
-                    match n.state {
-                        NodeState::MENU_ITEM => (),
-                        _ => {
+                    match &n.state {
+                        Menu(m) => match m {
+                            New => for cell in &mut graph.nodes {
+                                cell.state = Cell(Dead);
+                                let tile = settings.tiles[match cell.state {
+                                    Cell(s) => s as usize,
+                                    _ => 0 as usize
+                                }] as usize;
+                                bg.set_tile(
+                                    &mut vram,
+                                    (cell.x, cell.y),
+                                    &tileset,
+                                    background_tiles::tiles.tile_settings[tile]
+                                );
+                                // Default to Conway's Game of Life rules
+                                for i in 0..settings.rules.len() {
+                                for j in 0..settings.rules[0].len() {
+                                    settings.rules[i][j] = 0;
+                                }}
+                                settings.rules[0][3] = 1;
+                                settings.rules[1][2] = 1;
+                                settings.rules[1][3] = 1;
+                            },
+                            Save => save_world(&mut gba.save, &graph, &settings).expect("REASON"),
+                            Load => {
+                                load_world(&mut gba.save, &mut graph, &mut settings).expect("REASON");
+                                for n in &graph.nodes {
+                                    bg.set_tile(
+                                        &mut vram,
+                                        (n.x, n.y),
+                                        &tileset,
+                                        background_tiles::tiles.tile_settings[
+                                            settings.tiles[
+                                                match n.state { Cell(s) => s as usize, _ => 0 }
+                                            ] as usize
+                                        ],
+                                    );
+                                };
+                                for n in &graph_settings.nodes {
+                                    
+                                };
+                            }
+                        },
+                        Cell(s) => {
+                            n.state = Cell(!*s);
                             let r = &mut settings.rules
                                 [(n.y-settings.window_y-settings.rules_offset_y) as usize]
                                 [(n.x-settings.window_x-settings.rules_offset_x) as usize];
