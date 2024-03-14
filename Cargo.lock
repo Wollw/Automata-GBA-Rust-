@@ -3,6 +3,13 @@
 version = 3
 
 [[package]]
+name = "Automata-GBA"
+version = "0.1.0"
+dependencies = [
+ "agb",
+]
+
+[[package]]
 name = "adler"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -78,13 +85,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "agb_template"
-version = "0.1.0"
-dependencies = [
- "agb",
 ]
 
 [[package]]
